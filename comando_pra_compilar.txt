@@ -1,0 +1,9 @@
+gcc main.c drivers/display_sdl.c -o jogo.exe -IC:/msys64/ucrt64/include -LC:/msys64/ucrt64/lib -lmingw32 -lSDL2main -lSDL2 -lpthread -Wno-attributes
+
+gcc main.c gfx.c drivers/display_sdl.c -o jogo.exe -IC:/msys64/ucrt64/include -LC:/msys64/ucrt64/lib -lmingw32 -lSDL2main -lSDL2 -lpthread -Wno-attributes
+
+
+Nome - Radix
+
+palheta de cores para testar 
+Modo Claro: Fundo Creme (#F5F5DC) com detalhes em Marrom Terra (#5D4037). Isso dá um ar de papel antigo ou horta, muito sofisticado.Modo Escuro: Fundo Marrom Café Quase Preto (#211A1E) com detalhes em Branco Sujo ou Verde Água. O marrom escuro substitui o preto puro, dando uma identidade única ao hardware.

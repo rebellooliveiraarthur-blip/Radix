@@ -1,0 +1,10 @@
+{
+    "C_Cpp.default.compilerPath": "C:/msys64/mingw64/bin/gcc.exe",
+    "C_Cpp.default.includePath": [
+        "C:/msys64/mingw64/include",
+        "${workspaceFolder}/**"
+    ],
+    "C_Cpp.default.libraryPath": [
+        "C:/msys64/mingw64/lib"
+    ]
+}

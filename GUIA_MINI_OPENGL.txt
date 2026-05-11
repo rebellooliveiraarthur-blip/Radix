@@ -1,0 +1,1334 @@
+========================================================================
+ MINI-OPENGL PARA ESP32 — GUIA COMPLETO DE IMPLEMENTACAO
+========================================================================
+
+Este guia explica passo a passo como transformar seu gfx.c numa mini
+engine 3D/2D inspirada no OpenGL 1.x, otimizada para ESP32.
+
+A engine funciona por SOFTWARE RENDERING — nada de GPU. Tudo é feito
+na CPU, pixel por pixel. Por isso, performance e organizacao sao
+cruciais.
+
+========================================================================
+ ARQUITETURA GERAL — O PIPELINE GRAFICO
+========================================================================
+
+Qualquer engine 3D segue este fluxo:
+
+  [Vertex Data] → [Model Matrix] → [View Matrix] → [Projection Matrix]
+                      ↓
+                  [Clip Space] → [Perspective Divide] → [NDC]
+                      ↓
+                  [Viewport Transform] → [Screen Space]
+                      ↓
+                  [Rasterization] → [Fragment Shader] → [Framebuffer]
+
+No nosso caso (software renderer):
+
+  1. Usuario envia vertices (GFX_vertex)
+  2. Cada vertice passa pelas matrizes (model → view → projection)
+  3. Perspective divide (x/w, y/w, z/w)
+  4. Conversao para tela (viewport transform)
+  5. Rasterizador converte primitivas em pixels
+  6. Depth test, blending, write no framebuffer
+  7. display_update() envia framebuffer ao display
+
+========================================================================
+ FASE 1 — PRIMITIVE BATCHING (glBegin / glEnd)
+========================================================================
+
+PROBLEMA ATUAL:
+  GFX_draw_pixel() é chamado 1x por pixel. Para 1000 triangulos,
+  sao ~3000 chamadas de funcao + 3000 writes individuais. Muito lento.
+
+SOLUCAO:
+  Acumular vertices num buffer e rasterizar tudo de uma vez no
+  GFX_end(). Isso permite:
+  - Reutilizar estado (cor, matriz)
+  - Ordenar por textura/Z
+  - Otimizar o loop de rasterizacao
+
+----------------------------------------------------------------------
+1.1 — Definir o batch buffer
+----------------------------------------------------------------------
+
+No topo do gfx.c, adicione:
+
+  #define GFX_BATCH_MAX 512
+
+  typedef struct {
+      float x, y, z, w;   /* w sempre 1.0 antes da projecao */
+  } GFX_VertexEx;
+
+  typedef struct {
+      GFX_Primitive mode;
+      GFX_VertexEx verts[GFX_BATCH_MAX];
+      Color colors[GFX_BATCH_MAX];
+      int count;
+  } GFX_Batch;
+
+  static GFX_Batch _batch;
+
+----------------------------------------------------------------------
+1.2 — GFX_begin, GFX_vertex, GFX_end
+----------------------------------------------------------------------
+
+void GFX_begin(GFX_Primitive mode) {
+    _batch.mode = mode;
+    _batch.count = 0;
+}
+
+void GFX_vertex(float x, float y, float z) {
+    if (_batch.count >= GFX_BATCH_MAX) {
+        GFX_end();  /* auto-flush se cheio */
+        GFX_begin(_batch.mode);
+    }
+    _batch.verts[_batch.count].x = x;
+    _batch.verts[_batch.count].y = y;
+    _batch.verts[_batch.count].z = z;
+    _batch.verts[_batch.count].w = 1.0f;
+    _batch.colors[_batch.count] = _gfx_current_color;
+    _batch.count++;
+}
+
+----------------------------------------------------------------------
+1.3 — Rasterizador de Pontos
+----------------------------------------------------------------------
+
+static void _rasterize_point(GFX_VertexEx* v, Color color) {
+    /* Aplica viewport transform (simplificado) */
+    int sx = (int)(v->x * 0.5f + 0.5f) * WIDTH + WIDTH / 2;
+    int sy = (int)(v->y * 0.5f + 0.5f) * HEIGHT + HEIGHT / 2;
+
+    if (sx >= 0 && sx < WIDTH && sy >= 0 && sy < HEIGHT) {
+        GFX_buffer[sx][sy] = color;
+    }
+}
+
+----------------------------------------------------------------------
+1.4 — Rasterizador de Linhas (Bresenham — INTEIRO, sem float!)
+----------------------------------------------------------------------
+
+Bresenham e o algoritmo mais rapido para linhas. Usa SO inteiros.
+
+static void _rasterize_line(GFX_VertexEx* a, GFX_VertexEx* b,
+                            Color color_a, Color color_b) {
+    int x0 = (int)(a->x * 0.5f + 0.5f) * WIDTH + WIDTH / 2;
+    int y0 = (int)(a->y * 0.5f + 0.5f) * HEIGHT + HEIGHT / 2;
+    int x1 = (int)(b->x * 0.5f + 0.5f) * WIDTH + WIDTH / 2;
+    int y1 = (int)(b->y * 0.5f + 0.5f) * HEIGHT + HEIGHT / 2;
+
+    int dx = abs(x1 - x0);
+    int dy = -abs(y1 - y0);
+    int sx = x0 < x1 ? 1 : -1;
+    int sy = y0 < y1 ? 1 : -1;
+    int err = dx + dy;
+
+    int max_steps = dx > -dy ? dx : -dy;
+    float step = 1.0f / (float)max_steps;
+    float t = 0.0f;
+
+    while (1) {
+        /* Interpola cor */
+        Color c = _interpolate_color(color_a, color_b, t);
+
+        if (x0 >= 0 && x0 < WIDTH && y0 >= 0 && y0 < HEIGHT)
+            GFX_buffer[x0][y0] = c;
+
+        if (x0 == x1 && y0 == y1) break;
+
+        int e2 = 2 * err;
+        if (e2 >= dy) { err += dy; x0 += sx; }
+        if (e2 <= dx) { err += dx; y0 += sy; }
+
+        t += step;
+    }
+}
+
+Interpolacao de cor (RGB565 → interpola canais separados):
+
+static Color _interpolate_color(Color a, Color b, float t) {
+    uint8_t r1 = (a >> 11) & 0x1F;
+    uint8_t g1 = (a >> 5) & 0x3F;
+    uint8_t b1 = a & 0x1F;
+
+    uint8_t r2 = (b >> 11) & 0x1F;
+    uint8_t g2 = (b >> 5) & 0x3F;
+    uint8_t b2 = b & 0x1F;
+
+    uint8_t r = (uint8_t)(r1 + (r2 - r1) * t);
+    uint8_t g = (uint8_t)(g1 + (g2 - g1) * t);
+    uint8_t b = (uint8_t)(b1 + (b2 - b1) * t);
+
+    return (r << 11) | (g << 5) | b;
+}
+
+----------------------------------------------------------------------
+1.5 — Rasterizador de Triangulos (Edge Functions)
+----------------------------------------------------------------------
+
+O metodo mais eficiente usa "edge functions". Para cada pixel dentro
+do bounding box, testa se esta dentro do triangulo:
+
+Edge function (determinante 2D):
+  edge(x0,y0, x1,y1, x,y) = (x1-x0)*(y-y0) - (y1-y0)*(x-x0)
+
+Se todas as 3 edge functions tem o MESMO sinal → pixel dentro.
+
+static void _rasterize_triangle(GFX_VertexEx* v0, GFX_VertexEx* v1,
+                                GFX_VertexEx* v2,
+                                Color c0, Color c1, Color c2) {
+    /* Converter para screen space */
+    int x0 = (int)(v0->x * 0.5f + 0.5f) * WIDTH + WIDTH / 2;
+    int y0 = (int)(v0->y * 0.5f + 0.5f) * HEIGHT + HEIGHT / 2;
+    int x1 = (int)(v1->x * 0.5f + 0.5f) * WIDTH + WIDTH / 2;
+    int y1 = (int)(v1->y * 0.5f + 0.5f) * HEIGHT + HEIGHT / 2;
+    int x2 = (int)(v2->x * 0.5f + 0.5f) * WIDTH + WIDTH / 2;
+    int y2 = (int)(v2->y * 0.5f + 0.5f) * HEIGHT + HEIGHT / 2;
+
+    /* Bounding box */
+    int min_x = max(0,     min(x0, min(x1, x2)));
+    int min_y = max(0,     min(y0, min(y1, y2)));
+    int max_x = min(WIDTH-1, max(x0, max(x1, x2)));
+    int max_y = min(HEIGHT-1, max(y0, max(y1, y2)));
+
+    /* Area total do triangulo (edge function) */
+    int area = (x1 - x0) * (y2 - y0) - (y1 - y0) * (x2 - x0);
+    if (area == 0) return;  /* Degenerado */
+
+    float inv_area = 1.0f / (float)area;
+
+    for (int y = min_y; y <= max_y; y++) {
+        for (int x = min_x; x <= max_x; x++) {
+            /* Edge functions para este pixel */
+            int w0 = (x1 - x2) * (y - y2) - (y1 - y2) * (x - x2);
+            int w1 = (x2 - x0) * (y - y0) - (y2 - y0) * (x - x0);
+            int w2 = (x0 - x1) * (y - y1) - (y0 - y1) * (x - x1);
+
+            /* Todos do mesmo sinal? → dentro */
+            if ((w0 >= 0 && w1 >= 0 && w2 >= 0) ||
+                (w0 < 0  && w1 < 0  && w2 < 0)) {
+                /* Coordenadas baricentricas (0.0 - 1.0) */
+                float b0 = w0 * inv_area;
+                float b1 = w1 * inv_area;
+                float b2 = w2 * inv_area;
+
+                /* Interpola cor */
+                Color color = _interpolate_color_3(c0, c1, c2, b0, b1, b2);
+
+                /* TODO: depth test aqui quando Fase 6 estiver pronta */
+
+                GFX_buffer[x][y] = color;
+            }
+        }
+    }
+}
+
+Interpolacao de 3 cores por coordenadas baricentricas:
+
+static Color _interpolate_color_3(Color c0, Color c1, Color c2,
+                                   float b0, float b1, float b2) {
+    uint8_t r1 = (c0 >> 11) & 0x1F;
+    uint8_t g1 = (c0 >> 5) & 0x3F;
+    uint8_t b1 = c0 & 0x1F;
+
+    uint8_t r2 = (c1 >> 11) & 0x1F;
+    uint8_t g2 = (c1 >> 5) & 0x3F;
+    uint8_t b2 = c1 & 0x1F;
+
+    uint8_t r3 = (c2 >> 11) & 0x1F;
+    uint8_t g3 = (c2 >> 5) & 0x3F;
+    uint8_t b3 = c2 & 0x1F;
+
+    uint8_t r = (uint8_t)(r1*b0 + r2*b1 + r3*b2);
+    uint8_t g = (uint8_t)(g1*b0 + g2*b1 + g3*b2);
+    uint8_t b = (uint8_t)(b1*b0 + b2*b1 + b3*b2);
+
+    return (r << 11) | (g << 5) | b;
+}
+
+----------------------------------------------------------------------
+1.6 — GFX_end completo
+----------------------------------------------------------------------
+
+void GFX_end(void) {
+    switch (_batch.mode) {
+        case GFX_POINTS:
+            for (int i = 0; i < _batch.count; i++)
+                _rasterize_point(&_batch.verts[i], _batch.colors[i]);
+            break;
+
+        case GFX_LINES:
+            for (int i = 0; i < _batch.count - 1; i += 2)
+                _rasterize_line(&_batch.verts[i], &_batch.verts[i+1],
+                                _batch.colors[i], _batch.colors[i+1]);
+            break;
+
+        case GFX_TRIANGLES:
+            for (int i = 0; i < _batch.count - 2; i += 3)
+                _rasterize_triangle(&_batch.verts[i],
+                                    &_batch.verts[i+1],
+                                    &_batch.verts[i+2],
+                                    _batch.colors[i],
+                                    _batch.colors[i+1],
+                                    _batch.colors[i+2]);
+            break;
+    }
+    _batch.count = 0;
+}
+
+========================================================================
+ FASE 2 — MATRIX STACK
+========================================================================
+
+OpenGL usa matrizes 4x4 para transformacoes. Cada vertice e
+multiplicado pela matriz para ser transformado.
+
+----------------------------------------------------------------------
+2.1 — Definir Mat4
+----------------------------------------------------------------------
+
+typedef struct {
+    float m[16];  /* Column-major (igual OpenGL) */
+} Mat4;
+
+/* Indexacao visual:
+ *  | m[0]  m[4]  m[8]   m[12] |
+ *  | m[1]  m[5]  m[9]   m[13] |
+ *  | m[2]  m[6]  m[10]  m[14] |
+ *  | m[3]  m[7]  m[11]  m[15] |
+ */
+
+----------------------------------------------------------------------
+2.2 — Funcoes basicas
+----------------------------------------------------------------------
+
+/* Matriz identidade (nao faz nada) */
+Mat4 mat4_identity(void) {
+    Mat4 m = {0};
+    m.m[0] = m.m[5] = m.m[10] = m.m[15] = 1.0f;
+    return m;
+}
+
+/* Translacao */
+Mat4 mat4_translate(float x, float y, float z) {
+    Mat4 m = mat4_identity();
+    m.m[12] = x;
+    m.m[13] = y;
+    m.m[14] = z;
+    return m;
+}
+
+/* Escala */
+Mat4 mat4_scale(float x, float y, float z) {
+    Mat4 m = mat4_identity();
+    m.m[0] = x;
+    m.m[5] = y;
+    m.m[10] = z;
+    return m;
+}
+
+/* Rotacao em Z (2D) */
+Mat4 mat4_rotate_z(float angle_rad) {
+    Mat4 m = mat4_identity();
+    float c = cosf(angle_rad);
+    float s = sinf(angle_rad);
+    m.m[0] = c;   m.m[4] = -s;
+    m.m[1] = s;   m.m[5] = c;
+    return m;
+}
+
+/* Rotacao em X */
+Mat4 mat4_rotate_x(float angle_rad) {
+    Mat4 m = mat4_identity();
+    float c = cosf(angle_rad);
+    float s = sinf(angle_rad);
+    m.m[5] = c;   m.m[9] = -s;
+    m.m[6] = s;   m.m[10] = c;
+    return m;
+}
+
+/* Rotacao em Y */
+Mat4 mat4_rotate_y(float angle_rad) {
+    Mat4 m = mat4_identity();
+    float c = cosf(angle_rad);
+    float s = sinf(angle_rad);
+    m.m[0] = c;   m.m[8] = s;
+    m.m[2] = -s;  m.m[10] = c;
+    return m;
+}
+
+/* Multiplicacao de matrizes (A * B) */
+Mat4 mat4_multiply(Mat4 a, Mat4 b) {
+    Mat4 r = {0};
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            for (int k = 0; k < 4; k++) {
+                r.m[i + j*4] += a.m[i + k*4] * b.m[k + j*4];
+            }
+        }
+    }
+    return r;
+}
+
+/* Multiplicar matriz * vetor */
+GFX_VertexEx mat4_transform(Mat4 m, GFX_VertexEx v) {
+    GFX_VertexEx r;
+    r.x = m.m[0]*v.x + m.m[4]*v.y + m.m[8]*v.z  + m.m[12]*v.w;
+    r.y = m.m[1]*v.x + m.m[5]*v.y + m.m[9]*v.z  + m.m[13]*v.w;
+    r.z = m.m[2]*v.x + m.m[6]*v.y + m.m[10]*v.z + m.m[14]*v.w;
+    r.w = m.m[3]*v.x + m.m[7]*v.y + m.m[11]*v.z + m.m[15]*v.w;
+    return r;
+}
+
+----------------------------------------------------------------------
+2.3 — Pilha de matrizes (push/pop)
+----------------------------------------------------------------------
+
+#define MAT4_STACK_MAX 32
+
+static Mat4 _model_matrix = {0};  /* Comeca como identidade */
+static Mat4 _matrix_stack[MAT4_STACK_MAX];
+static int _matrix_stack_top = 0;
+
+void GFX_matrix_push(void) {
+    if (_matrix_stack_top < MAT4_STACK_MAX) {
+        _matrix_stack[_matrix_stack_top++] = _model_matrix;
+    }
+}
+
+void GFX_matrix_pop(void) {
+    if (_matrix_stack_top > 0) {
+        _model_matrix = _matrix_stack[--_matrix_stack_top];
+    }
+}
+
+void GFX_matrix_identity(void) {
+    _model_matrix = mat4_identity();
+}
+
+void GFX_matrix_translate(float x, float y, float z) {
+    _model_matrix = mat4_multiply(_model_matrix, mat4_translate(x, y, z));
+}
+
+void GFX_matrix_rotate(float angle_rad, float ax, float ay, float az) {
+    Mat4 rot = mat4_identity();
+    /* Rotacao por eixo arbitrario — usar quaternion ou Euler */
+    if (ax != 0) rot = mat4_multiply(rot, mat4_rotate_x(angle_rad * ax));
+    if (ay != 0) rot = mat4_multiply(rot, mat4_rotate_y(angle_rad * ay));
+    if (az != 0) rot = mat4_multiply(rot, mat4_rotate_z(angle_rad * az));
+    _model_matrix = mat4_multiply(_model_matrix, rot);
+}
+
+void GFX_matrix_scale(float x, float y, float z) {
+    _model_matrix = mat4_multiply(_model_matrix, mat4_scale(x, y, z));
+}
+
+========================================================================
+ FASE 3 — PROJECTION & CAMERA
+========================================================================
+
+----------------------------------------------------------------------
+3.1 — Matriz Ortho (2D / UI)
+----------------------------------------------------------------------
+
+Mat4 mat4_ortho(float left, float right, float bottom, float top,
+                float near, float far) {
+    Mat4 m = {0};
+    m.m[0]  = 2.0f / (right - left);
+    m.m[5]  = 2.0f / (top - bottom);
+    m.m[10] = -2.0f / (far - near);
+    m.m[12] = -(right + left) / (right - left);
+    m.m[13] = -(top + bottom) / (top - bottom);
+    m.m[14] = -(far + near) / (far - near);
+    m.m[15] = 1.0f;
+    return m;
+}
+
+----------------------------------------------------------------------
+3.2 — Matriz Perspectiva (3D)
+----------------------------------------------------------------------
+
+Mat4 mat4_perspective(float fov_rad, float aspect, float near, float far) {
+    Mat4 m = {0};
+    float f = 1.0f / tanf(fov_rad / 2.0f);
+    m.m[0]  = f / aspect;
+    m.m[5]  = f;
+    m.m[10] = (far + near) / (near - far);
+    m.m[11] = -1.0f;
+    m.m[14] = (2.0f * far * near) / (near - far);
+    return m;
+}
+
+----------------------------------------------------------------------
+3.3 — Look At (camera)
+----------------------------------------------------------------------
+
+typedef struct { float x, y, z; } Vec3;
+
+Vec3 vec3_sub(Vec3 a, Vec3 b) {
+    return (Vec3){a.x-b.x, a.y-b.y, a.z-b.z};
+}
+
+float vec3_dot(Vec3 a, Vec3 b) {
+    return a.x*b.x + a.y*b.y + a.z*b.z;
+}
+
+Vec3 vec3_cross(Vec3 a, Vec3 b) {
+    return (Vec3){
+        a.y*b.z - a.z*b.y,
+        a.z*b.x - a.x*b.z,
+        a.x*b.y - a.y*b.x
+    };
+}
+
+float vec3_len(Vec3 v) {
+    return sqrtf(v.x*v.x + v.y*v.y + v.z*v.z);
+}
+
+Vec3 vec3_normalize(Vec3 v) {
+    float len = vec3_len(v);
+    if (len > 0) {
+        float inv = 1.0f / len;
+        v.x *= inv; v.y *= inv; v.z *= inv;
+    }
+    return v;
+}
+
+Mat4 mat4_look_at(Vec3 eye, Vec3 target, Vec3 up) {
+    Vec3 f = vec3_normalize(vec3_sub(target, eye));
+    Vec3 r = vec3_normalize(vec3_cross(f, up));
+    Vec3 u = vec3_cross(r, f);
+
+    Mat4 m = mat4_identity();
+    m.m[0] = r.x;  m.m[4] = r.y;  m.m[8]  = r.z;  m.m[12] = -vec3_dot(r, eye);
+    m.m[1] = u.x;  m.m[5] = u.y;  m.m[9]  = u.z;  m.m[13] = -vec3_dot(u, eye);
+    m.m[2] = -f.x; m.m[6] = -f.y; m.m[10] = -f.z; m.m[14] = vec3_dot(f, eye);
+    return m;
+}
+
+----------------------------------------------------------------------
+3.4 — Integrar projecao ao pipeline
+----------------------------------------------------------------------
+
+static Mat4 _view_matrix = {0};
+static Mat4 _projection_matrix = {0};
+
+void GFX_set_view(Mat4 view) {
+    _view_matrix = view;
+}
+
+void GFX_set_projection(Mat4 proj) {
+    _projection_matrix = proj;
+}
+
+/* Modificar GFX_vertex para aplicar matrizes */
+void GFX_vertex(float x, float y, float z) {
+    GFX_VertexEx v = {x, y, z, 1.0f};
+
+    /* Pipeline: Model → View → Projection */
+    Mat4 mvp = mat4_multiply(_projection_matrix,
+                mat4_multiply(_view_matrix, _model_matrix));
+
+    v = mat4_transform(mvp, v);
+
+    /* Perspective divide */
+    if (v.w != 0) {
+        v.x /= v.w;
+        v.y /= v.w;
+        v.z /= v.w;
+    }
+
+    /* Armazenar no batch (agora em NDC: -1 a 1) */
+    if (_batch.count < GFX_BATCH_MAX) {
+        _batch.verts[_batch.count] = v;
+        _batch.colors[_batch.count] = _gfx_current_color;
+        _batch.count++;
+    }
+}
+
+/* Atualizar rasterizador para NDC → Screen */
+static int ndc_to_screen_x(float ndc_x) {
+    return (int)((ndc_x * 0.5f + 0.5f) * WIDTH);
+}
+
+static int ndc_to_screen_y(float ndc_y) {
+    return (int)((1.0f - (ndc_y * 0.5f + 0.5f)) * HEIGHT);
+}
+
+/* Nota: Y e invertido porque NDC tem Y+ pra cima, tela tem Y+ pra baixo */
+
+========================================================================
+ FASE 4 — VERTEX PIPELINE
+========================================================================
+
+----------------------------------------------------------------------
+4.1 — Vertex com atributos
+----------------------------------------------------------------------
+
+typedef struct {
+    float x, y, z, w;   /* Posicao */
+    float nx, ny, nz;   /* Normal (para iluminacao futura) */
+    float u, v;         /* Coordenadas de textura */
+} GFX_VertexFull;
+
+----------------------------------------------------------------------
+4.2 — Vertex Arrays (estilo glVertexPointer)
+----------------------------------------------------------------------
+
+/*
+ * OpenGL moderno usa vertex arrays. Voce pode imitar:
+ *
+ *   float vertices[] = {
+ *       // x     y     z     r     g     b
+ *       -1.0f, -1.0f, 0.0f, 1.0f, 0.0f, 0.0f,
+ *        1.0f, -1.0f, 0.0f, 0.0f, 1.0f, 0.0f,
+ *        0.0f,  1.0f, 0.0f, 0.0f, 0.0f, 1.0f,
+ *   };
+ *
+ *   GFX_enable_vertex_array(3);  // 3 = posicao XYZ
+ *   GFX_vertex_pointer(vertices, 6 * sizeof(float));  // stride
+ *   GFX_enable_color_array(3);   // 3 = cor RGB
+ *   GFX_color_pointer(vertices + 3, 6 * sizeof(float));
+ *   GFX_draw_arrays(GFX_TRIANGLES, 0, 3);
+ */
+
+----------------------------------------------------------------------
+4.3 — Clipping
+----------------------------------------------------------------------
+
+Antes de rasterizar, vertices fora do viewport devem ser cortados.
+
+Metodo simples: Sutherland-Hodgman (recortar contra 6 planos):
+  x >= -w, x <= w, y >= -w, y <= w, z >= -w, z <= w
+
+Para um mini-engine, pode pular clipping e so fazer:
+  - Testar se bounding box do triangulo intersecta tela
+  - Pular triangulos completamente fora
+
+========================================================================
+ FASE 5 — STATE MACHINE
+========================================================================
+
+----------------------------------------------------------------------
+5.1 — Struct de contexto
+----------------------------------------------------------------------
+
+typedef struct {
+    /* Cores */
+    Color current_color;
+
+    /* Matrizes */
+    Mat4 model_matrix;
+    Mat4 view_matrix;
+    Mat4 projection_matrix;
+    Mat4 matrix_stack[MAT4_STACK_MAX];
+    int matrix_stack_top;
+
+    /* Batch */
+    GFX_Primitive batch_mode;
+    GFX_VertexEx batch_verts[GFX_BATCH_MAX];
+    Color batch_colors[GFX_BATCH_MAX];
+    int batch_count;
+
+    /* Flags */
+    int wireframe_enabled;
+    int depth_test_enabled;
+    int blend_enabled;
+
+    /* Viewport */
+    int viewport_x, viewport_y, viewport_w, viewport_h;
+
+    /* Depth buffer */
+    uint16_t depth_buffer[WIDTH * HEIGHT];
+
+} GFX_Context;
+
+static GFX_Context _ctx;
+
+----------------------------------------------------------------------
+5.2 — Inicializacao
+----------------------------------------------------------------------
+
+void GFX_init(void) {
+    _ctx.current_color = 0xFFFF;
+    _ctx.model_matrix = mat4_identity();
+    _ctx.view_matrix = mat4_identity();
+    _ctx.projection_matrix = mat4_ortho(0, WIDTH, HEIGHT, 0, -1, 1);
+    _ctx.matrix_stack_top = 0;
+    _ctx.batch_count = 0;
+    _ctx.wireframe_enabled = 0;
+    _ctx.depth_test_enabled = 0;
+    _ctx.blend_enabled = 0;
+    _ctx.viewport_x = 0;
+    _ctx.viewport_y = 0;
+    _ctx.viewport_w = WIDTH;
+    _ctx.viewport_h = HEIGHT;
+}
+
+----------------------------------------------------------------------
+5.3 — Enable / Disable
+----------------------------------------------------------------------
+
+#define GFX_WIREFRAME  1
+#define GFX_DEPTH_TEST 2
+#define GFX_BLEND      4
+
+void GFX_enable(int flag) {
+    if (flag & GFX_WIREFRAME)  _ctx.wireframe_enabled = 1;
+    if (flag & GFX_DEPTH_TEST) _ctx.depth_test_enabled = 1;
+    if (flag & GFX_BLEND)      _ctx.blend_enabled = 1;
+}
+
+void GFX_disable(int flag) {
+    if (flag & GFX_WIREFRAME)  _ctx.wireframe_enabled = 0;
+    if (flag & GFX_DEPTH_TEST) _ctx.depth_test_enabled = 0;
+    if (flag & GFX_BLEND)      _ctx.blend_enabled = 0;
+}
+
+----------------------------------------------------------------------
+5.4 — Viewport
+----------------------------------------------------------------------
+
+void GFX_viewport(int x, int y, int w, int h) {
+    _ctx.viewport_x = x;
+    _ctx.viewport_y = y;
+    _ctx.viewport_w = w;
+    _ctx.viewport_h = h;
+}
+
+/* Atualizar NDC → Screen para usar viewport */
+static int ndc_to_screen_x(float ndc_x) {
+    return _ctx.viewport_x + (int)((ndc_x * 0.5f + 0.5f) * _ctx.viewport_w);
+}
+
+static int ndc_to_screen_y(float ndc_y) {
+    return _ctx.viewport_y + (int)((1.0f - (ndc_y * 0.5f + 0.5f)) * _ctx.viewport_h);
+}
+
+========================================================================
+ FASE 6 — DEPTH BUFFER (Z-Buffer)
+========================================================================
+
+----------------------------------------------------------------------
+6.1 — Estrutura
+----------------------------------------------------------------------
+
+static uint16_t _zbuffer[WIDTH * HEIGHT];  /* Linear para cache */
+
+----------------------------------------------------------------------
+6.2 — Clear depth
+----------------------------------------------------------------------
+
+void GFX_clear_depth(float depth) {
+    uint16_t z = (uint16_t)(depth * 65535.0f);
+    for (int i = 0; i < WIDTH * HEIGHT; i++) {
+        _zbuffer[i] = z;
+    }
+}
+
+----------------------------------------------------------------------
+6.3 — Depth test
+----------------------------------------------------------------------
+
+static int _depth_test(int x, int y, float z_ndc) {
+    if (!_ctx.depth_test_enabled) return 1;  /* Sem teste → sempre passa */
+
+    /* z_ndc vai de -1 (perto) a 1 (longe). Mapear para 0-65535 */
+    uint16_t z = (uint16_t)((z_ndc * 0.5f + 0.5f) * 65535.0f);
+
+    int idx = y * WIDTH + x;
+    if (z < _zbuffer[idx]) {
+        _zbuffer[idx] = z;  /* Mais perto → atualiza */
+        return 1;
+    }
+    return 0;  /* Mais longe → nao desenha */
+}
+
+----------------------------------------------------------------------
+6.4 — Integrar ao rasterizador
+----------------------------------------------------------------------
+
+No _rasterize_triangle, adicionar interpolacao de Z:
+
+  /* Interpolar z por coordenadas baricentricas */
+  float z_interp = v0->z * b0 + v1->z * b1 + v2->z * b2;
+
+  if (_depth_test(x, y, z_interp)) {
+      GFX_buffer[x][y] = color;
+  }
+
+========================================================================
+ FASE 7 — TEXTURAS
+========================================================================
+
+----------------------------------------------------------------------
+7.1 — Estrutura de textura
+----------------------------------------------------------------------
+
+typedef struct {
+    Color* data;
+    int width;
+    int height;
+    int id;
+} GFX_Texture;
+
+#define GFX_MAX_TEXTURES 16
+static GFX_Texture _textures[GFX_MAX_TEXTURES];
+static int _next_texture_id = 1;
+static int _bound_texture_id = 0;  /* 0 = nenhuma */
+
+----------------------------------------------------------------------
+7.2 — Criar textura
+----------------------------------------------------------------------
+
+int GFX_create_texture(Color* data, int w, int h) {
+    int id = _next_texture_id++;
+    int idx = id - 1;
+    if (idx >= GFX_MAX_TEXTURES) return -1;
+
+    _textures[idx].data = malloc(w * h * sizeof(Color));
+    _textures[idx].width = w;
+    _textures[idx].height = h;
+    _textures[idx].id = id;
+
+    memcpy(_textures[idx].data, data, w * h * sizeof(Color));
+    return id;
+}
+
+----------------------------------------------------------------------
+7.3 — Bind e sample
+----------------------------------------------------------------------
+
+void GFX_bind_texture(int id) {
+    _bound_texture_id = id;
+}
+
+static Color _sample_texture(float u, float v) {
+    if (_bound_texture_id == 0) return 0xFFFF;
+
+    int idx = _bound_texture_id - 1;
+    GFX_Texture* tex = &_textures[idx];
+
+    /* Wrapping (repeat) */
+    u = u - floorf(u);
+    v = v - floorf(v);
+
+    int x = (int)(u * tex->width) % tex->width;
+    int y = (int)(v * tex->height) % tex->height;
+
+    return tex->data[y * tex->width + x];
+}
+
+/* Bilinear filtering (mais suave): */
+static Color _sample_texture_bilinear(float u, float v) {
+    int idx = _bound_texture_id - 1;
+    GFX_Texture* tex = &_textures[idx];
+
+    float fx = u * tex->width;
+    float fy = v * tex->height;
+    int x0 = (int)floorf(fx) % tex->width;
+    int y0 = (int)floorf(fy) % tex->height;
+    int x1 = (x0 + 1) % tex->width;
+    int y1 = (y0 + 1) % tex->height;
+    float sx = fx - floorf(fx);
+    float sy = fy - floorf(fy);
+
+    Color c00 = tex->data[y0 * tex->width + x0];
+    Color c10 = tex->data[y0 * tex->width + x1];
+    Color c01 = tex->data[y1 * tex->width + x0];
+    Color c11 = tex->data[y1 * tex->width + x1];
+
+    /* Interpola bilinear (converter para RGB separado) */
+    /* ... interpolar R, G, B separadamente ... */
+    return c00;  /* Simplificado — implementar completo */
+}
+
+----------------------------------------------------------------------
+7.4 — UV no vertex
+----------------------------------------------------------------------
+
+Adicionar u, v ao GFX_VertexEx e interpolar no rasterizador:
+
+  float u = v0->u * b0 + v1->u * b1 + v2->u * b2;
+  float v = v0->v * b0 + v1->v * b1 + v2->v * b2;
+  Color texel = _sample_texture(u, v);
+
+  /* Combinar com cor do vertex */
+  Color final = _blend_colors(vertex_color, texel);
+
+========================================================================
+ FASE 8 — MESH / VAO
+========================================================================
+
+----------------------------------------------------------------------
+8.1 — Estrutura de mesh
+----------------------------------------------------------------------
+
+typedef struct {
+    GFX_VertexFull* vertices;
+    int vertex_count;
+    unsigned short* indices;
+    int index_count;
+    int has_indices;
+} GFX_Mesh;
+
+----------------------------------------------------------------------
+8.2 — Criar mesh
+----------------------------------------------------------------------
+
+GFX_Mesh* GFX_create_mesh(GFX_VertexFull* verts, int vcount,
+                          unsigned short* indices, int icount) {
+    GFX_Mesh* mesh = malloc(sizeof(GFX_Mesh));
+    mesh->vertices = malloc(vcount * sizeof(GFX_VertexFull));
+    mesh->vertex_count = vcount;
+    memcpy(mesh->vertices, verts, vcount * sizeof(GFX_VertexFull));
+
+    if (indices && icount > 0) {
+        mesh->indices = malloc(icount * sizeof(unsigned short));
+        mesh->index_count = icount;
+        mesh->has_indices = 1;
+        memcpy(mesh->indices, indices, icount * sizeof(unsigned short));
+    } else {
+        mesh->indices = NULL;
+        mesh->index_count = 0;
+        mesh->has_indices = 0;
+    }
+
+    return mesh;
+}
+
+----------------------------------------------------------------------
+8.3 — Desenhar mesh
+----------------------------------------------------------------------
+
+void GFX_draw_mesh(GFX_Mesh* mesh) {
+    Mat4 mvp = mat4_multiply(_ctx.projection_matrix,
+                mat4_multiply(_ctx.view_matrix, _ctx.model_matrix));
+
+    /* Transformar todos os vertices uma vez */
+    for (int i = 0; i < mesh->vertex_count; i++) {
+        GFX_VertexFull* v = &mesh->vertices[i];
+        GFX_VertexEx transformed = {v->x, v->y, v->z, 1.0f};
+        transformed = mat4_transform(mvp, transformed);
+        if (transformed.w != 0) {
+            transformed.x /= transformed.w;
+            transformed.y /= transformed.w;
+            transformed.z /= transformed.w;
+        }
+
+        /* Adicionar ao batch */
+        _batch.verts[_batch.count] = transformed;
+        _batch.colors[_batch.count] = _ctx.current_color;
+        _batch.count++;
+    }
+
+    /* Rasterizar */
+    GFX_end();
+}
+
+----------------------------------------------------------------------
+8.4 — Indexed drawing (reusa vertices)
+----------------------------------------------------------------------
+
+void GFX_draw_mesh_indexed(GFX_Mesh* mesh) {
+    if (!mesh->has_indices) {
+        GFX_draw_mesh(mesh);
+        return;
+    }
+
+    Mat4 mvp = mat4_multiply(_ctx.projection_matrix,
+                mat4_multiply(_ctx.view_matrix, _ctx.model_matrix));
+
+    /* Transformar vertices */
+    for (int i = 0; i < mesh->vertex_count; i++) {
+        GFX_VertexFull* v = &mesh->vertices[i];
+        GFX_VertexEx transformed = {v->x, v->y, v->z, 1.0f};
+        transformed = mat4_transform(mvp, transformed);
+        if (transformed.w != 0) {
+            transformed.x /= transformed.w;
+            transformed.y /= transformed.w;
+            transformed.z /= transformed.w;
+        }
+        _batch.verts[i] = transformed;
+        _batch.colors[i] = _ctx.current_color;
+    }
+    _batch.count = mesh->vertex_count;
+
+    /* Rasterizar por indices */
+    for (int i = 0; i < mesh->index_count; i += 3) {
+        int i0 = mesh->indices[i];
+        int i1 = mesh->indices[i+1];
+        int i2 = mesh->indices[i+2];
+
+        _rasterize_triangle(&_batch.verts[i0],
+                            &_batch.verts[i1],
+                            &_batch.verts[i2],
+                            _batch.colors[i0],
+                            _batch.colors[i1],
+                            _batch.colors[i2]);
+    }
+}
+
+========================================================================
+ FASE 9 — SHADER-LIKE PIPELINE
+========================================================================
+
+Em vez de hardcode, permitir que o usuario defina funcoes:
+
+----------------------------------------------------------------------
+9.1 — Vertex Shader Callback
+----------------------------------------------------------------------
+
+typedef struct {
+    float x, y, z, w;
+    float u, v;
+    Color color;
+    /* ... mais atributos ... */
+} Shader_Vertex;
+
+typedef void (*VertexShaderFn)(Shader_Vertex* input, Shader_Vertex* output);
+
+void GFX_set_vertex_shader(VertexShaderFn shader) {
+    _ctx.vertex_shader = shader;
+}
+
+/* Exemplo de uso no usuario: */
+void my_vertex_shader(Shader_Vertex* in, Shader_Vertex* out) {
+    /* Copia posicao */
+    out->x = in->x;
+    out->y = in->y;
+    out->z = in->z;
+    out->w = in->w;
+
+    /* Aplica rotacao manual */
+    float angle = SDL_GetTicks() * 0.001f;
+    float c = cosf(angle);
+    float s = sinf(angle);
+    out->x = in->x * c - in->y * s;
+    out->y = in->x * s + in->y * c;
+
+    /* Passa cor e UV */
+    out->color = in->color;
+    out->u = in->u;
+    out->v = in->v;
+}
+
+----------------------------------------------------------------------
+9.2 — Fragment Shader Callback
+----------------------------------------------------------------------
+
+typedef struct {
+    float x, y, z;   /* Screen position */
+    float u, v;      /* Interpolated UV */
+    Color color;     /* Interpolated vertex color */
+} Fragment;
+
+typedef Color (*FragmentShaderFn)(Fragment* frag);
+
+void GFX_set_fragment_shader(FragmentShaderFn shader) {
+    _ctx.fragment_shader = shader;
+}
+
+/* Exemplo de uso: */
+Color my_fragment_shader(Fragment* frag) {
+    /* Textura + cor */
+    Color texel = _sample_texture(frag->u, frag->v);
+    return _blend_colors(frag->color, texel);
+}
+
+----------------------------------------------------------------------
+9.3 — Pipeline completo com shaders
+----------------------------------------------------------------------
+
+No _rasterize_triangle:
+
+  /* Para cada pixel dentro do triangulo */
+  Fragment frag;
+  frag.x = (float)x;
+  frag.y = (float)y;
+  frag.z = z_interp;
+  frag.u = u_interp;
+  frag.v = v_interp;
+  frag.color = color_interp;
+
+  Color final = _ctx.fragment_shader(&frag);
+  GFX_buffer[x][y] = final;
+
+========================================================================
+ FASE 10 — PERFORMANCE PARA ESP32 REAL
+========================================================================
+
+----------------------------------------------------------------------
+10.1 — Buffer Linear
+----------------------------------------------------------------------
+
+TROCAR:
+  Color GFX_buffer[WIDTH][HEIGHT];  /* Double indirection → cache miss */
+
+POR:
+  Color GFX_buffer[WIDTH * HEIGHT]; /* Linear → cache friendly */
+
+  Acesso:
+    GFX_buffer[y * WIDTH + x]
+
+  Clear:
+    memset(GFX_buffer, 0, WIDTH * HEIGHT * sizeof(Color));
+
+----------------------------------------------------------------------
+10.2 — SDL Display Update (no emulator)
+----------------------------------------------------------------------
+
+TROCAR (atual — MUITO lento):
+  for (y) for (x) {
+      SDL_SetRenderDrawColor(...);
+      SDL_RenderFillRect(...);
+  }
+
+POR (textura — 100x mais rapido):
+
+  static SDL_Texture* texture = NULL;
+  static uint32_t pixels[WIDTH * HEIGHT];
+
+  /* No init: */
+  texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB565,
+                              SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT);
+
+  /* No display_update: */
+  /* Converter GFX_buffer (Color = uint16_t) para pixels (uint32_t) */
+  for (int i = 0; i < WIDTH * HEIGHT; i++) {
+      uint16_t c = GFX_buffer[i];
+      uint8_t r = (c >> 11) << 3;
+      uint8_t g = ((c >> 5) & 0x3F) << 2;
+      uint8_t b = (c & 0x1F) << 3;
+      pixels[i] = (r << 16) | (g << 8) | b;
+  }
+
+  SDL_UpdateTexture(texture, NULL, pixels, WIDTH * sizeof(uint32_t));
+  SDL_RenderCopy(renderer, texture, NULL, NULL);
+  SDL_RenderPresent(renderer);
+
+----------------------------------------------------------------------
+10.3 — ESP32 Real — DMA para Display
+----------------------------------------------------------------------
+
+Para display SPI (ST7789, ILI9341, etc):
+
+  #include "driver/spi_master.h"
+  #include "esp_heap_caps.h"
+
+  /* Framebuffer em DMA-capable memory */
+  Color* fb = heap_caps_malloc(WIDTH * HEIGHT * sizeof(Color),
+                               MALLOC_CAP_DMA);
+
+  /* Enviar via SPI com DMA */
+  spi_transaction_t trans = {
+      .tx_buffer = fb,
+      .length = WIDTH * HEIGHT * sizeof(Color) * 8,
+  };
+  spi_device_queue_trans(spi_handle, &trans, portMAX_DELAY);
+
+----------------------------------------------------------------------
+10.4 — Fixed-Point (Q16.16)
+----------------------------------------------------------------------
+
+Se FPU for lento no ESP32, usar fixed-point:
+
+  typedef int32_t fixed_t;
+
+  #define FIXED_ONE   (1 << 16)
+  #define FIXED_HALF  (1 << 15)
+
+  /* Converter float → fixed */
+  fixed_t float_to_fixed(float f) {
+      return (fixed_t)(f * FIXED_ONE);
+  }
+
+  /* Converter fixed → float */
+  float fixed_to_float(fixed_t f) {
+      return (float)f / FIXED_ONE;
+  }
+
+  /* Operacoes */
+  fixed_t fixed_add(fixed_t a, fixed_t b) { return a + b; }
+  fixed_t fixed_sub(fixed_t a, fixed_t b) { return a - b; }
+  fixed_t fixed_mul(fixed_t a, fixed_t b) { return (a * b) >> 16; }
+  fixed_t fixed_div(fixed_t a, fixed_t b) { return (a << 16) / b; }
+
+  /* Usar no rasterizador: */
+  fixed_t x = float_to_fixed(10.5f);
+  fixed_t y = float_to_fixed(20.3f);
+  fixed_t product = fixed_mul(x, y);  /* Sem FPU! */
+
+----------------------------------------------------------------------
+10.5 — Lookup Tables (sin/cos)
+----------------------------------------------------------------------
+
+Evitar math.h no runtime:
+
+  #define LUT_SIZE 256
+  static float sin_lut[LUT_SIZE];
+  static float cos_lut[LUT_SIZE];
+
+  void lut_init(void) {
+      for (int i = 0; i < LUT_SIZE; i++) {
+          float angle = (float)i / LUT_SIZE * 2.0f * 3.14159f;
+          sin_lut[i] = sinf(angle);
+          cos_lut[i] = cosf(angle);
+      }
+  }
+
+  float fast_sin(float angle) {
+      /* Normalizar para 0-255 */
+      int idx = (int)(angle / (2.0f * 3.14159f) * LUT_SIZE) % LUT_SIZE;
+      if (idx < 0) idx += LUT_SIZE;
+      return sin_lut[idx];
+  }
+
+  float fast_cos(float angle) {
+      int idx = (int)(angle / (2.0f * 3.14159f) * LUT_SIZE) % LUT_SIZE;
+      if (idx < 0) idx += LUT_SIZE;
+      return cos_lut[idx];
+  }
+
+----------------------------------------------------------------------
+10.6 — Inline Functions
+----------------------------------------------------------------------
+
+GFX_draw_pixel deve ser inline:
+
+  static inline void GFX_draw_pixel(int x, int y, Color c) {
+      if (x >= 0 && x < WIDTH && y >= 0 && y < HEIGHT) {
+          GFX_buffer[y * WIDTH + x] = c;
+      }
+  }
+
+  /* Ou macro (ainda mais rapido, mas menos seguro): */
+  #define GFX_DRAW_PIXEL(x, y, c) do { \
+      if ((x) >= 0 && (x) < WIDTH && (y) >= 0 && (y) < HEIGHT) \
+          GFX_buffer[(y) * WIDTH + (x)] = (c); \
+  } while(0)
+
+----------------------------------------------------------------------
+10.7 — Double Buffering (anti-flicker)
+----------------------------------------------------------------------
+
+  Color* fb_front = NULL;  /* O que o display mostra */
+  Color* fb_back = NULL;   /* O que voce desenha */
+
+  void GFX_swap_buffers(void) {
+      /* Troca ponteiros — O(1) */
+      Color* temp = fb_front;
+      fb_front = fb_back;
+      fb_back = temp;
+  }
+
+  /* No main loop: */
+  while (1) {
+      GFX_clear(0);          /* Limpa back buffer */
+      draw_scene();          /* Desenha no back buffer */
+      GFX_swap_buffers();    /* Troca */
+      display_update(fb_front);
+  }
+
+========================================================================
+ COMO USAR NO MAIN (EXEMPLO FINAL)
+========================================================================
+
+int main(void) {
+    /* Init */
+    display_init();
+    GFX_init();
+    GFX_set_projection(mat4_ortho(0, 320, 240, 0, -1, 1));
+
+    float angle = 0;
+
+    while (display_is_running()) {
+        GFX_clear(0x0000);
+
+        /* Quadrado rotacionando no centro */
+        GFX_matrix_push();
+            GFX_matrix_translate(160, 120, 0);
+            GFX_matrix_rotate(angle, 0, 0, 1);
+            GFX_matrix_scale(50, 50, 1);
+
+            GFX_set_color(0xF800);
+            GFX_begin(GFX_TRIANGLES);
+                GFX_vertex(-1, -1, 0);
+                GFX_vertex( 1, -1, 0);
+                GFX_vertex(-1,  1, 0);
+                GFX_vertex( 1, -1, 0);
+                GFX_vertex( 1,  1, 0);
+                GFX_vertex(-1,  1, 0);
+            GFX_end();
+        GFX_matrix_pop();
+
+        /* Circulo (triangle fan) */
+        GFX_set_color(0x07E0);
+        GFX_begin(GFX_TRIANGLES);
+        int segments = 16;
+        for (int i = 0; i < segments; i++) {
+            float a1 = (float)i / segments * 6.28318f;
+            float a2 = (float)(i+1) / segments * 6.28318f;
+            GFX_vertex(100, 100, 0);  /* Centro */
+            GFX_vertex(100 + cosf(a1) * 20, 100 + sinf(a1) * 20, 0);
+            GFX_vertex(100 + cosf(a2) * 20, 100 + sinf(a2) * 20, 0);
+        }
+        GFX_end();
+
+        display_update(GFX_buffer);
+        angle += 0.02f;
+        SDL_Delay(16);
+    }
+
+    display_close();
+    return 0;
+}
+
+========================================================================
+ REFERENCIAS
+========================================================================
+
+1. Software Rendering:
+   - "Triangle Rasterization" — https://www.scratchapixel.com
+   - "Software Rendering" by Nicolas Capens (SwiftShader creator)
+   - https://jtsorlinis.github.io/rendering-tutorial/
+
+2. Matematica:
+   - "3D Math Primer for Graphics" — Fletcher Dunn
+   - https://www.songho.ca/opengl/ (matrizes explicadas)
+
+3. Bresenham:
+   - https://en.wikipedia.org/wiki/Bresenham%27s_line_algorithm
+
+4. Edge Functions / Barycentric:
+   - https://www.scratchapixel.com/lessons/3d-basic-rendering/
+     rasterization-practical-implementation/overview-rasterization-algorithm
+
+5. ESP32 Display Drivers:
+   - https://github.com/lovyan03/LovyanGFX
+   - https://github.com/esp-arduino-libs/esp32-display-driver
+
+6. Fixed-Point Math:
+   - https://en.wikipedia.org/wiki/Fixed-point_arithmetic
+
+7. Otimizacoes:
+   - "Optimizing Software Rasterizers" — Fabian Giesen (ryg)
+   - https://fgiesen.wordpress.com/
+
+========================================================================
+ ORDEM RECOMENDADA DE IMPLEMENTACAO
+========================================================================
+
+  Semana 1: Fase 1 (Batch + Rasterizadores)
+  Semana 2: Fase 2 (Matrix Stack)
+  Semana 3: Fase 3 (Projection) + Fase 5 (State Machine)
+  Semana 4: Fase 6 (Depth Buffer)
+  Semana 5: Fase 7 (Texturas)
+  Semana 6: Fase 8 (Mesh/VAO)
+  Semana 7: Fase 10 (Performance ESP32)
+  Semana 8: Fase 9 (Shaders) + Polimento
+
+========================================================================
+ FIM DO GUIA
+========================================================================
