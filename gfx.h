@@ -93,24 +93,25 @@ typedef struct {
 } Vertex;
 
 typedef struct {
-    int largura;    // Ex: 160 para Game Boy
-    int altura;     // Ex: 144 para Game Boy
-    Color* dados;   // Ponteiro para o array de pixels (RGB565)
+    int largura;
+    int altura; 
+    Color* dados;
 } Sprite;
 
 
-/* 3. Variáveis de Estado (Usam o MAX_VERTICES definido acima) */
 extern Color GFX_buffer[WIDTH * HEIGHT]; 
 extern Vertex vertexBuffer[MAX_VERTICES]; // Agora o compilador sabe o tamanho!
 extern int vertexCount;
 
-/* 4. Protótipos da API */
 void GFX_begin(GFX_Primitive mode);
-void GFX_vertex(float x, float y, float z);
+void GFX_vertex(float x, float y, float z, float u, float v);
 void GFX_end(void);
 void GFX_set_color(Color cor);
 void GFX_clear(Color cor);
-void GFX_draw_sprite_scaled(Sprite* sprite, int dx, int dy, int dw, int dh);
+void GFX_draw_sprite_scaled(Sprite* sprite, int dx, int dy, float dz, int dw, int dh);
 void GFX_set_background_color(Color cor);
-// ... restante das funções
+void GFX_draw_rectangle(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, float z);
+void _GFX_draw_line(float x0, float y0, float x1, float y1, float z);
+void GFX_bind_sprite(Sprite* sprite);
+
 #endif

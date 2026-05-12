@@ -1,77 +1,62 @@
 #include "display.h"
 #include "gfx.h"
-#include "assets/background/background_sprite.h"
+#include "object_manager.h"
 #include <SDL2/SDL.h>
 
-typedef enum { 
-    ESTADO_LOADING, 
-    ESTADO_MENU,
-    ESTADO_CONFIG, 
-    ESTADO_JOGO 
-} Estado;
-
-int timerLoading = 0;
-Estado estadoAtual = ESTADO_MENU;
-
-#define ____ 0x0000
-#define BRAN 0xFFFF
-#define ROSA 0xF810
+// Cores e Sprite de teste
 #define VERD 0x07E0
-#define CAST 0x8200
+#define VERM 0xF800
+#define BRAN 0xFFFF
+#define ____ 0x0000
 
-// Um sprite 4x4 simples (ex: uma carinha ou padrão)
-Color pixels_teste[] = {
-    BRAN, ____, ____, BRAN,
-    ____, VERD, VERD, ____,
-    ____, VERD, VERD, ____,
-    BRAN, ____, ____, BRAN
+Color pixels_teste[] = { 
+    BRAN, ____, ____, BRAN, 
+    ____, VERD, VERD, ____, 
+    ____, VERD, VERD, ____, 
+    BRAN, ____, ____, BRAN 
 };
-
 Sprite meuSprite = { 4, 4, pixels_teste };
-
-
-/*
- * TODO: Vertex já definido em gfx.h — não redefinir aqui.
- * Quando o batch system estiver pronto:
- *
- *   GFX_begin(GFX_TRIANGLES);
- *       GFX_set_color(0xF800);
- *       GFX_vertex(50, 50, 0);
- *       GFX_vertex(90, 50, 0);
- *       GFX_vertex(50, 90, 0);
- *   GFX_end();
- *
- * Com matrix stack (Fase 2):
- *
- *   GFX_matrix_push();
- *       GFX_matrix_translate(160, 120, 0);
- *       GFX_matrix_rotate(time * 0.001f, 0, 0, 1);
- *       GFX_begin(GFX_TRIANGLES);
- *           GFX_set_color(0x07E0);
- *           GFX_vertex(-20, -20, 0);
- *           GFX_vertex( 20, -20, 0);
- *           GFX_vertex(  0,  20, 0);
- *       GFX_end();
- *   GFX_matrix_pop();
- *
- * Com depth buffer (Fase 6):
- *
- *   GFX_clear_color_and_depth(0x0000, 1.0f);
- *   GFX_enable(GFX_DEPTH_TEST);
- *   ... desenhar objetos em qualquer ordem ...
- */
 
 int main(int argc, char* argv[]) {
     if(!display_init()) return 1;
 
-    while(display_is_running()) {
-        GFX_clear(____); // Limpa o buffer linear
+    // --- CONFIGURAÇÃO INICIAL DOS OBJETOS ---
+    
+    // 1. Um quadrado vermelho fixo ao fundo (Z = 2.0)
+    OM_create_object(-50, -50, 2.0f, VERM);
 
-        if (estadoAtual == ESTADO_MENU) {
-            GFX_set_background_color(BRAN);
+    // 2. Um objeto que usará imagem (Sprite) e vai "pulsar" (Z = 1.0)
+    Objeto* objAnimado = OM_create_object(0, 0, 1.0f, 0x0000);
+    objAnimado->sprite = &meuSprite;
+
+    int frame_count = 0;
+
+    while(display_is_running()) {
+        // 1. Limpa tudo
+        GFX_clear(0x1082); // Fundo azul
+
+        // 2. Lógica de animação simples para o teste
+        frame_count++;
+        if (frame_count % 60 == 0) {
+            // A cada 1 segundo, alterna o tamanho alvo
+            if (objAnimado->target_sx == 1.0f) {
+                objAnimado->target_sx = 5.0f; // Cresce 5x
+                objAnimado->target_sy = 5.0f;
+            } else {
+                objAnimado->target_sx = 1.0f; // Volta ao normal
+                objAnimado->target_sy = 1.0f;
+            }
         }
-        // O display_update agora recebe o buffer linear que você definiu
-        display_update(GFX_buffer); 
+
+        // 3. ATUALIZAÇÃO (Calcula o LERP das escalas)
+        OM_update_all();
+
+        // 4. RENDERIZAÇÃO (Desenha todos os objetos do pool)
+        OM_render_all();
+
+        // Atualiza o hardware/janela
+        display_update(GFX_buffer);
+        SDL_Delay(16);
     }
 
     display_close();

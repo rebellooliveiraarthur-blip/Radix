@@ -10,6 +10,10 @@ int display_init() {
     window = SDL_CreateWindow("Radish OS Emulator", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 
                               WIDTH * SCALE, HEIGHT * SCALE, 0);
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    if (!renderer) {
+        renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    }
+    if (!renderer) return 0;
     return 1;
 }
 
