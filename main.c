@@ -2,51 +2,85 @@
 #include "gfx.h"
 #include "object_manager.h"
 #include <SDL2/SDL.h>
-#include <math.h>
 
-#define ____ 0x0000
-#define BRAN 0xFFFF
-#define VERD 0x07E0
-#define VERM 0xF800
-
-Color pixels_teste[] = { 
-    BRAN, ____, ____, BRAN, 
-    ____, VERD, VERD, ____, 
-    ____, VERD, VERD, ____, 
-    BRAN, ____, ____, BRAN 
-};
-Sprite meuSprite = { 4, 4, pixels_teste };
+#define NUM_GAMES 6
 
 int main(int argc, char* argv[]) {
     if(!display_init()) return 1;
 
-    Objeto* green = OM_create_object(0, 20, 2.0f, VERD);
-    float time = 0.0f;
+    Color game_colors[NUM_GAMES] = {
+        0xF800, 0x07E0, 0xFFE0, 0x8010, 0x07FF, 0xF81F
+    };
 
-    while(display_is_running()) {
-        time += 0.05f;
+    int running = 1;
+    Objeto* games[NUM_GAMES];
+    float spacing = 52.0f;
+    float start_x = -((NUM_GAMES - 1) * spacing) / 2.0f;
 
-        green->target_sx = 1.0f + 3.0f * (0.5f + 0.5f * sin(time * 2.0f));
-        green->target_sy = green->target_sx;
-        green->x = 50.0f * sin(time * 1.5f);
+    for (int i = 0; i < NUM_GAMES; i++) {
+        games[i] = OM_create_object(start_x + i * spacing, 0, 0.5f, game_colors[i]);
+    }
 
-        GFX_clear(0x1082);
+    int selected = 0;
+    games[selected]->target_sx = 1.5f;
+    games[selected]->target_sy = 1.5f;
+
+    while (running) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            if (ev.type == SDL_QUIT) running = 0;
+            if (ev.type == SDL_KEYDOWN) {
+                if (ev.key.keysym.sym == SDLK_LEFT || ev.key.keysym.sym == SDLK_a) {
+                    games[selected]->target_sx = 1.0f;
+                    games[selected]->target_sy = 1.0f;
+                    selected = (selected - 1 + NUM_GAMES) % NUM_GAMES;
+                    games[selected]->target_sx = 1.5f;
+                    games[selected]->target_sy = 1.5f;
+                }
+                if (ev.key.keysym.sym == SDLK_RIGHT || ev.key.keysym.sym == SDLK_d) {
+                    games[selected]->target_sx = 1.0f;
+                    games[selected]->target_sy = 1.0f;
+                    selected = (selected + 1) % NUM_GAMES;
+                    games[selected]->target_sx = 1.5f;
+                    games[selected]->target_sy = 1.5f;
+                }
+            }
+        }
+        if (!running) break;
+
+        GFX_clear(0x0008);
+
+        GFX_set_color(0x14A5);
+        GFX_draw_rectangle(-160, -120, 160, -120, 160, -85, -160, -85, 1.0f);
+        GFX_draw_rectangle(-160, 75, 160, 75, 160, 120, -160, 120, 1.0f);
 
         OM_update_all();
         OM_render_all();
 
-        GFX_set_color(VERM);
+        Objeto* sel = games[selected];
+        float ind_w = 8.0f * sel->sx;
+        float ind_y = sel->y + 15.0f * sel->sy;
+        GFX_set_color(0xFFFF);
+        GFX_draw_rectangle(
+            sel->x - ind_w, ind_y,
+            sel->x + ind_w, ind_y,
+            sel->x + ind_w, ind_y + 5.0f,
+            sel->x - ind_w, ind_y + 5.0f,
+            0.2f
+        );
+
+        GFX_set_color(0xFFFF);
         GFX_begin(GFX_TRIANGLES);
-            GFX_vertex(0, -50, 1.0f, 0, 0);
-            GFX_vertex(60, 40, 1.0f, 0, 0);
-            GFX_vertex(-60, 40, 1.0f, 0, 0);
+            GFX_vertex(-145, -2, 0.2f, 0, 0);
+            GFX_vertex(-135, -8, 0.2f, 0, 0);
+            GFX_vertex(-135, 4, 0.2f, 0, 0);
         GFX_end();
 
-        GFX_bind_sprite(&meuSprite);
-        GFX_draw_rectangle(20, -40, 80, -40, 80, 20, 20, 20, 1.5f);
-        GFX_bind_sprite(NULL);
-
-        GFX_draw_sprite_scaled(&meuSprite, -100, -50, 0.5f, 64, 64);
+        GFX_begin(GFX_TRIANGLES);
+            GFX_vertex(145, -2, 0.2f, 0, 0);
+            GFX_vertex(135, -8, 0.2f, 0, 0);
+            GFX_vertex(135, 4, 0.2f, 0, 0);
+        GFX_end();
 
         display_update(GFX_buffer);
         SDL_Delay(16);
