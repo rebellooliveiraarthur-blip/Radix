@@ -3,6 +3,7 @@
 
 static SDL_Window* window = NULL;
 static SDL_Renderer* renderer = NULL;
+static SDL_Texture* texture = NULL;
 static int running = 1;
 
 int display_init() {
@@ -14,40 +15,30 @@ int display_init() {
         renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
     }
     if (!renderer) return 0;
+
+    texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_RGB565,
+                                SDL_TEXTUREACCESS_STREAMING, WIDTH, HEIGHT);
+    if (!texture) return 0;
+
     return 1;
 }
 
-void display_update(Color* buffer) { // Mudou de matriz para ponteiro
+void display_update(Color* buffer) {
     SDL_Event ev;
     while(SDL_PollEvent(&ev)) {
         if(ev.type == SDL_QUIT) running = 0;
     }
 
-    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+    SDL_UpdateTexture(texture, NULL, buffer, WIDTH * sizeof(uint16_t));
     SDL_RenderClear(renderer);
-
-    for (int y = 0; y < HEIGHT; y++) {
-        for (int x = 0; x < WIDTH; x++) {
-            // Acesso linear ao buffer
-            Color c = buffer[y * WIDTH + x]; 
-
-            // Conversão RGB565 -> RGB888
-            uint8_t r = (c >> 11) << 3;
-            uint8_t g = ((c >> 5) & 0x3F) << 2;
-            uint8_t b = (c & 0x1F) << 3;
-
-            SDL_SetRenderDrawColor(renderer, r, g, b, 255);
-            SDL_Rect rect = { x * SCALE, y * SCALE, SCALE, SCALE };
-            SDL_RenderFillRect(renderer, &rect);
-        }
-    }
-
+    SDL_RenderCopy(renderer, texture, NULL, NULL);
     SDL_RenderPresent(renderer);
 }
 
 int display_is_running() { return running; }
 
 void display_close() {
+    SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
     SDL_Quit();

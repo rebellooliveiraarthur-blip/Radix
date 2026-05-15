@@ -87,7 +87,7 @@ typedef enum {
 } GFX_Primitive;
 
 typedef struct {
-    float x, y, z; 
+    float x, y; 
     float u, v;     
     Color color;    
 } Vertex;
@@ -104,14 +104,14 @@ extern Vertex vertexBuffer[MAX_VERTICES]; // Agora o compilador sabe o tamanho!
 extern int vertexCount;
 
 void GFX_begin(GFX_Primitive mode);
-void GFX_vertex(float x, float y, float z, float u, float v);
+void GFX_vertex(float x, float y, float u, float v);
 void GFX_end(void);
 void GFX_set_color(Color cor);
 void GFX_clear(Color cor);
-void GFX_draw_sprite_scaled(Sprite* sprite, int dx, int dy, float dz, int dw, int dh);
+void GFX_draw_sprite_scaled(Sprite* sprite, int dx, int dy, int dw, int dh);
 void GFX_set_background_color(Color cor);
-void GFX_draw_rectangle(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3, float z);
-void _GFX_draw_line(float x0, float y0, float x1, float y1, float z);
+void GFX_draw_rectangle(float x0, float y0, float x1, float y1, float x2, float y2, float x3, float y3);
+void _GFX_draw_line(float x0, float y0, float x1, float y1);
 void GFX_bind_sprite(Sprite* sprite);
 
 #endif
